@@ -1,6 +1,6 @@
 # app.py
 # UAE Used Car Price Predictor — Streamlit
-# Full, deploy-ready app with optional Description column handling,
+# Full, deploy-ready app with optional Description handling,
 # robust ML pipeline, conformal uncertainty, and polished UX.
 
 import os
@@ -187,9 +187,16 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
     # Features for training
     num_cols = ["Mileage_capped","Age","Mileage_per_year","Cylinders_imputed"]
 
+    # ---- OneHotEncoder cross-version compatibility (sklearn>=1.7 uses sparse_output) ----
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        # Older sklearn
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
+
     transformers = [
         (
-            "num",
+            "preprocess_num",
             Pipeline(
                 steps=[
                     ("sel", FunctionTransformer(lambda X: X[num_cols], feature_names_out="one-to-one")),
@@ -199,7 +206,7 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
             ),
             num_cols,
         ),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse=True), cat_cols),
+        ("cat", ohe, cat_cols),
     ]
     if used_text:
         transformers.append(
@@ -436,8 +443,8 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
     )
 
     # Get feature names from the FITTED preprocessor in the pipeline
-    ct: ColumnTransformer = model.named_steps["preprocess"]
     try:
+        ct: ColumnTransformer = model.named_steps["preprocess"]
         feature_names = ct.get_feature_names_out().tolist()
     except Exception:
         feature_names = [f"f{i}" for i in range(len(r.importances_mean))]
@@ -446,6 +453,8 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
     def base_col(name: str) -> str:
         if name.startswith("cat__"):
             return name.split("__", 1)[1].split("_", 1)[0]
+        if name.startswith("preprocess_num__"):
+            return name.split("__", 1)[1]
         if name.startswith("num__"):
             return name.split("__", 1)[1]
         if name.startswith("txt__"):
@@ -744,7 +753,6 @@ def main():
             lb = pd.DataFrame(lb_obj)
             st.dataframe(lb, use_container_width=True)
         elif isinstance(lb_obj, dict):
-            # Back-compat if older cache stored dict-of-lists
             try:
                 st.dataframe(pd.DataFrame(lb_obj), use_container_width=True)
             except Exception:
