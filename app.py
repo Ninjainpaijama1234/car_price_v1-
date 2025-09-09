@@ -149,9 +149,9 @@ def _build_ohe() -> OneHotEncoder:
     params = {"handle_unknown": "ignore"}
     sig = inspect.signature(OneHotEncoder)
     if "sparse_output" in sig.parameters:
-        params["sparse_output"] = True
+        params["sparse_output"] = False # Set to False for dense output
     elif "sparse" in sig.parameters:
-        params["sparse"] = True
+        params["sparse"] = False # Set to False for dense output
     return OneHotEncoder(**params)
 
 def _extract_text_column(X):
