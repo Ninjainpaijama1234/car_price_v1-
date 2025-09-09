@@ -20,11 +20,11 @@ import plotly.graph_objects as go
 from scipy.sparse import issparse
 
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split, KFold, RandomizedSearchCV, cross_val_predict
+from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, RobustScaler, FunctionTransformer
@@ -149,9 +149,9 @@ def _build_ohe() -> OneHotEncoder:
     params = {"handle_unknown": "ignore"}
     sig = inspect.signature(OneHotEncoder)
     if "sparse_output" in sig.parameters:
-        params["sparse_output"] = False # Set to False for dense output
+        params["sparse_output"] = True
     elif "sparse" in sig.parameters:
-        params["sparse"] = False # Set to False for dense output
+        params["sparse"] = True
     return OneHotEncoder(**params)
 
 def _extract_text_column(X):
@@ -239,7 +239,10 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
 # ----------------------------- Modeling & Selection ---------------------------
 
 def _rmse(y_true, y_pred) -> float:
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    try:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        return float(math.sqrt(mean_squared_error(y_true, y_pred)))
 
 def _mape(y_true, y_pred) -> float:
     y_true = np.array(y_true, dtype=float)
@@ -249,122 +252,6 @@ def _mape(y_true, y_pred) -> float:
 
 def _inverse_predict(log_preds: np.ndarray) -> np.ndarray:
     return safe_expm1(log_preds)
-
-def _xgb_candidate():
-    try:
-        from xgboost import XGBRegressor
-        xgb = XGBRegressor(
-            objective="reg:squarederror",
-            random_state=RANDOM_STATE,
-            n_estimators=400,
-            tree_method="hist",
-            n_jobs=-1,
-        )
-        param_dist = {
-            "model__n_estimators": [300, 400, 600, 800],
-            "model__max_depth": [3, 4, 6, 8],
-            "model__learning_rate": np.linspace(0.02, 0.2, 10),
-            "model__subsample": np.linspace(0.6, 1.0, 5),
-            "model__colsample_bytree": np.linspace(0.6, 1.0, 5),
-            "model__min_child_weight": [1, 2, 5, 10],
-        }
-        return ("XGBoost", xgb, param_dist)
-    except Exception:
-        return None
-
-def _hgbr_candidate():
-    hgbr = HistGradientBoostingRegressor(random_state=RANDOM_STATE)
-    param_dist = {
-        "model__max_depth": [3, 5, 7, None],
-        "model__max_leaf_nodes": [15, 31, 63, None],
-        "model__learning_rate": np.linspace(0.03, 0.2, 8),
-        "model__l2_regularization": np.linspace(0.0, 1.0, 6),
-    }
-    return ("HistGB", hgbr, param_dist)
-
-def _rf_candidate():
-    rf = RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1)
-    param_dist = {
-        "model__n_estimators": [200, 400, 600],
-        "model__max_depth": [None, 10, 20, 30],
-        "model__min_samples_split": [2, 5, 10],
-        "model__max_features": ["sqrt", "log2", 0.5, 0.8],
-    }
-    return ("RandomForest", rf, param_dist)
-
-# Cache hashers for unhashable sklearn objects (avoid UnhashableParamError)
-CACHE_HASH_FUNCS = {
-    ColumnTransformer: id,
-    Pipeline: id,
-    FunctionTransformer: id,
-    TfidfVectorizer: id,
-    OneHotEncoder: id,
-}
-
-@st.cache_resource(show_spinner=True, hash_funcs=CACHE_HASH_FUNCS)
-def train_and_select_model(X: pd.DataFrame, y: np.ndarray, _preprocessor: ColumnTransformer):
-    # Hold-out split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
-
-    # Candidates
-    candidates = []
-    xgb_c = _xgb_candidate()
-    if xgb_c:
-        candidates.append(xgb_c)
-    candidates += [_hgbr_candidate(), _rf_candidate()]
-
-    leaderboard = []
-    best = None
-    best_cv_mae = np.inf
-    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-
-    for name, model, param_dist in candidates:
-        pipe = Pipeline(
-            steps=[
-                ("preprocess", _preprocessor),
-                ("densify", FunctionTransformer(_densify, validate=False)),
-                ("model", model),
-            ]
-        )
-        search = RandomizedSearchCV(
-            estimator=pipe,
-            param_distributions=param_dist,
-            n_iter=15,
-            scoring="neg_mean_absolute_error",
-            cv=kf,
-            n_jobs=-1,
-            random_state=RANDOM_STATE,
-            verbose=0,
-            refit=True,
-        )
-        search.fit(X_train, y_train)
-
-        cv_mae = -search.best_score_
-        oof_pred = cross_val_predict(search.best_estimator_, X_train, y_train, cv=kf, n_jobs=-1)
-        oof_pred_aed = _inverse_predict(oof_pred)
-        y_train_aed = _inverse_predict(y_train)
-        r2 = r2_score(y_train_aed, oof_pred_aed)
-        rmse = _rmse(y_train_aed, oof_pred_aed)
-
-        leaderboard.append({"Model": name, "CV MAE (AED)": float(cv_mae),
-                            "Train OOF R²": float(r2), "Train OOF RMSE (AED)": float(rmse)})
-
-        if cv_mae < best_cv_mae:
-            best_cv_mae = cv_mae
-            best = search.best_estimator_
-
-    # Fit best on all training
-    best.fit(X_train, y_train)
-
-    # Conformal calibration residuals (OOF on train)
-    oof_pred_best = cross_val_predict(best, X_train, y_train, cv=kf, n_jobs=-1)
-    oof_pred_best_aed = _inverse_predict(oof_pred_best)
-    y_train_aed = _inverse_predict(y_train)
-    abs_residuals = np.abs(y_train_aed - oof_pred_best_aed).tolist()
-
-    cv_meta = {"X_test": X_test, "y_test": y_test, "abs_residuals": abs_residuals}
-    lb = pd.DataFrame(leaderboard).sort_values("CV MAE (AED)")
-    return best, lb, cv_meta
 
 # ----------------------------- Conformal & Prediction -------------------------
 
@@ -552,37 +439,24 @@ def main():
     df = load_data(DEFAULT_DATA_PATH)
     X, y, preprocessor, meta = make_features(df)
 
-    # Train or load model
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    if os.path.exists(BEST_MODEL_PATH) and os.path.exists(CONFORMAL_PATH):
-        best_model = joblib.load(BEST_MODEL_PATH)
-        with open(CONFORMAL_PATH, "r") as f:
-            conf_state = json.load(f)
-        abs_residuals = conf_state.get("abs_residuals", [])
-        X_test_idx = conf_state.get("X_test_idx", [])
-        y_test = np.array(conf_state.get("y_test", []))
-        leaderboard_cache = conf_state.get("leaderboard", None)
-    else:
-        with st.spinner("Training models & selecting the best..."):
-            best_model, lb, cv_meta = train_and_select_model(X, y, preprocessor)
-        joblib.dump(best_model, BEST_MODEL_PATH)
-        X_test = cv_meta["X_test"]; y_test = cv_meta["y_test"]
-        abs_residuals = cv_meta["abs_residuals"]
-        leaderboard_cache = lb.to_dict(orient="records")
-        conf_dump = {
-            "abs_residuals": abs_residuals,
-            "X_test_idx": X_test.index.tolist(),
-            "y_test": y_test.tolist(),
-            "leaderboard": leaderboard_cache,
-        }
-        with open(CONFORMAL_PATH, "w") as f:
-            json.dump(conf_dump, f)
-        X_test_idx = X_test.index.tolist()
+    # Load pre-trained model
+    if not os.path.exists(BEST_MODEL_PATH) or not os.path.exists(CONFORMAL_PATH):
+        st.error("Model files not found. Please run the original `app.py` once to train and save the model.")
+        st.stop()
+        
+    best_model = joblib.load(BEST_MODEL_PATH)
+    with open(CONFORMAL_PATH, "r") as f:
+        conf_state = json.load(f)
+        
+    abs_residuals = conf_state.get("abs_residuals", [])
+    X_test_idx = conf_state.get("X_test_idx", [])
+    y_test = np.array(conf_state.get("y_test", []))
+    leaderboard_cache = conf_state.get("leaderboard", None)
 
     # Sidebar UI
     ui = sidebar_inputs(df, meta)
 
-    tabs = st.tabs(["💰 Price Quote", "📈 Insights", "🧠 Model", "🔧 What-If", "🧪 Data QA"])
+    tabs = st.tabs(["💰 Price Quote", "📈 Insights", "🧠 Model"])
 
     # --- Price Quote ---
     with tabs[0]:
@@ -689,11 +563,6 @@ def main():
     # --- Model ---
     with tabs[2]:
         st.subheader("Model Performance & Diagnostics")
-        with open(CONFORMAL_PATH, "r") as f:
-            conf_state = json.load(f)
-        abs_residuals = conf_state["abs_residuals"]
-        X_test_idx = conf_state["X_test_idx"]
-        y_test = np.array(conf_state["y_test"])
         X_test = X.iloc[X_test_idx]
 
         alpha_default = 0.1
@@ -708,14 +577,8 @@ def main():
         kpi_cols[5].metric("Avg PI Width", format_aed(evals["avg_pi_width"]))
 
         st.markdown("#### Model Leaderboard (Cross-Validation)")
-        lb_obj = conf_state.get("leaderboard")
-        if isinstance(lb_obj, list):
-            st.dataframe(pd.DataFrame(lb_obj), use_container_width=True)
-        elif isinstance(lb_obj, dict):
-            try:
-                st.dataframe(pd.DataFrame(lb_obj), use_container_width=True)
-            except Exception:
-                st.info("Leaderboard not available.")
+        if isinstance(leaderboard_cache, list):
+            st.dataframe(pd.DataFrame(leaderboard_cache), use_container_width=True)
         else:
             st.info("Leaderboard not available.")
 
@@ -735,83 +598,6 @@ def main():
                                   title="Top Feature Groups (Permutation Importance)",
                                   labels={"importance": "Importance (abs)", "column": "Feature Group"}),
                          use_container_width=True)
-
-    # --- What-If ---
-    with tabs[3]:
-        st.subheader("What-If Sensitivity")
-        colA, colB = st.columns(2)
-        with colA:
-            mk = st.selectbox("Make (PDP)", options=sorted(df["Make"].unique()))
-        with colB:
-            md = st.selectbox("Model (PDP)", options=sorted(df.loc[df["Make"] == mk, "Model"].unique()))
-        base = df[(df["Make"] == mk) & (df["Model"] == md)].iloc[:1]
-        if base.empty:
-            st.info("Not enough samples for this Make/Model.")
-        else:
-            base_row = base.iloc[0].to_dict()
-            mileage_cap_series = _iqr_cap(df["Mileage"])
-
-            baseline = {
-                "Mileage_capped": float(np.clip(np.nanmedian(df["Mileage"]), mileage_cap_series.min(), mileage_cap_series.max())),
-                "Age": float(np.clip(pd.Timestamp.today().year - int(np.nanmedian(pd.to_numeric(df["Year"], errors="coerce"))), 0, 30)),
-                "Mileage_per_year": 1.0,
-                "Cylinders_imputed": float(np.nanmedian(pd.to_numeric(df["Cylinders"], errors="coerce"))) if not df["Cylinders"].dropna().empty else 4.0,
-                "Make": mk, "Model": md,
-                "Body Type": base_row.get("Body Type", "__Other__"),
-                "Transmission_simplified": _simplify_transmission(base_row.get("Transmission", "")),
-                "Fuel Type": base_row.get("Fuel Type", "__Other__"),
-                "Color": base_row.get("Color", "__Other__"),
-                "Location": base_row.get("Location", "__Other__"),
-                "Description": ""
-            }
-
-            years = list(range(2005, 2025))
-            pdp_year = []
-            for yv in years:
-                xi = baseline.copy()
-                xi["Age"] = float(np.clip(pd.Timestamp.today().year - yv, 0, 30))
-                xi["Mileage_per_year"] = xi["Mileage_capped"] / max(1, xi["Age"])
-                xdf = pd.DataFrame([xi])[X.columns]
-                pred = _inverse_predict(best_model.predict(xdf))[0]
-                pdp_year.append(pred)
-            st.plotly_chart(px.line(x=years, y=pdp_year, markers=True, title="Price vs Year (holding other factors constant)",
-                                   labels={"x": "Year", "y": "Estimated Price (AED)"}), use_container_width=True)
-
-            miles_grid = np.linspace(10000, 300000, 25).astype(int)
-            pdp_miles = []
-            for m in miles_grid:
-                xi = baseline.copy()
-                xi["Mileage_capped"] = float(np.clip(m, mileage_cap_series.min(), mileage_cap_series.max()))
-                xi["Mileage_per_year"] = xi["Mileage_capped"] / max(1, xi["Age"])
-                xdf = pd.DataFrame([xi])[X.columns]
-                pred = _inverse_predict(best_model.predict(xdf))[0]
-                pdp_miles.append(pred)
-            st.plotly_chart(px.line(x=miles_grid, y=pdp_miles, markers=True, title="Price vs Mileage (holding other factors constant)",
-                                   labels={"x": "Mileage (km)", "y": "Estimated Price (AED)"}), use_container_width=True)
-
-    # --- Data QA ---
-    with tabs[4]:
-        st.subheader("Data QA")
-        miss = df.isna().mean().reset_index()
-        miss.columns = ["Column", "Missing Ratio"]
-        st.plotly_chart(px.bar(miss.sort_values("Missing Ratio", ascending=False), x="Missing Ratio", y="Column", orientation="h",
-                                  title="Missingness by Column", labels={"Missing Ratio": "Fraction Missing"}),
-                         use_container_width=True)
-
-        outliers = pd.DataFrame({
-            "Metric": ["Price < p1", "Price > p99", "Mileage < p1", "Mileage > p99"],
-            "Count": [
-                int((df["Price"] < df["Price"].quantile(0.01)).sum()),
-                int((df["Price"] > df["Price"].quantile(0.99)).sum()),
-                int((df["Mileage"] < df["Mileage"].quantile(0.01)).sum()),
-                int((df["Mileage"] > df["Mileage"].quantile(0.99)).sum()),
-            ],
-        })
-        st.dataframe(outliers, use_container_width=True)
-        card = pd.DataFrame({"Column": df.columns, "Cardinality": [df[c].nunique() for c in df.columns]})
-        st.dataframe(card.sort_values("Cardinality", ascending=False), use_container_width=True)
-        st.markdown("#### Sample Rows")
-        st.dataframe(df.sample(min(10, len(df))), use_container_width=True)
 
 if __name__ == "__main__":
     main()
