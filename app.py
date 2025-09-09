@@ -1,7 +1,6 @@
 # app.py
 # UAE Used Car Price Predictor — Streamlit
-# Full, deploy-ready app with optional Description handling,
-# robust ML pipeline, conformal uncertainty, and polished UX.
+# Deploy-ready app with sklearn OHE compatibility + cache fix for unhashable params.
 
 import os
 import io
@@ -44,8 +43,7 @@ def format_aed(x: float) -> str:
         return f"{AED} -"
 
 def safe_expm1(x: t.Union[float, np.ndarray]) -> t.Union[float, np.ndarray]:
-    # clamp to avoid overflow
-    return np.expm1(np.clip(x, a_min=-25, a_max=25))
+    return np.expm1(np.clip(x, a_min=-25, a_max=25))  # clamp to avoid overflow
 
 def success_badge_color(coverage: float) -> str:
     if 0.88 <= coverage <= 0.92:
@@ -85,11 +83,9 @@ def load_data(path: str) -> pd.DataFrame:
         st.error(f"Missing required columns: {missing}")
         st.stop()
 
-    # If Description isn’t present, create an empty column so the TF-IDF branch can be skipped cleanly
     if "Description" not in df.columns:
         df["Description"] = ""
 
-    # Normalize text columns
     for col in ["Make","Model","Body Type","Fuel Type","Color","Location","Transmission","Description"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
@@ -163,12 +159,12 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
     df.loc[df["Cylinders_imputed"].isna(), "Cylinders_imputed"] = group_median[df["Cylinders_imputed"].isna()]
     df["Cylinders_imputed"] = df["Cylinders_imputed"].fillna(global_median)
 
-    # Convert to numeric
+    # Numeric conversions
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["Mileage"] = pd.to_numeric(df["Mileage"], errors="coerce")
     df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
 
-    # Guard outliers for training (preserve raw)
+    # Robust capping (training only)
     df["Price_capped"] = _iqr_cap(df["Price"])
     df["Mileage_capped"] = _iqr_cap(df["Mileage"])
 
@@ -184,14 +180,13 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
 
     used_text = _maybe_text_branch(df)
 
-    # Features for training
+    # Numeric block
     num_cols = ["Mileage_capped","Age","Mileage_per_year","Cylinders_imputed"]
 
-    # ---- OneHotEncoder cross-version compatibility (sklearn>=1.7 uses sparse_output) ----
+    # OHE cross-version (sklearn>=1.7 uses sparse_output)
     try:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
     except TypeError:
-        # Older sklearn
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
 
     transformers = [
@@ -300,7 +295,16 @@ def _rf_candidate():
     }
     return ("RandomForest", rf, param_dist)
 
-@st.cache_resource(show_spinner=True)
+# CACHE FIX: Many sklearn objects are unhashable (lambdas, transformers). We instruct Streamlit how to hash them.
+CACHE_HASH_FUNCS = {
+    ColumnTransformer: id,
+    Pipeline: id,
+    FunctionTransformer: id,
+    TfidfVectorizer: id,
+    OneHotEncoder: id,
+}
+
+@st.cache_resource(show_spinner=True, hash_funcs=CACHE_HASH_FUNCS)
 def train_and_select_model(X: pd.DataFrame, y: np.ndarray, preprocessor: ColumnTransformer):
     # Hold-out
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
@@ -430,7 +434,6 @@ def evaluate_holdout(
 def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarray, max_samples: int = 2000) -> pd.DataFrame:
     from sklearn.inspection import permutation_importance
 
-    # Subsample for speed
     if len(X) > max_samples:
         idx = np.random.RandomState(RANDOM_STATE).choice(len(X), size=max_samples, replace=False)
         Xs = X.iloc[idx]
@@ -442,14 +445,13 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
         model, Xs, ys, n_repeats=5, random_state=RANDOM_STATE, n_jobs=-1, scoring="neg_mean_absolute_error"
     )
 
-    # Get feature names from the FITTED preprocessor in the pipeline
+    # Feature names from fitted preprocessor
     try:
         ct: ColumnTransformer = model.named_steps["preprocess"]
         feature_names = ct.get_feature_names_out().tolist()
     except Exception:
         feature_names = [f"f{i}" for i in range(len(r.importances_mean))]
 
-    # Aggregate to original columns
     def base_col(name: str) -> str:
         if name.startswith("cat__"):
             return name.split("__", 1)[1].split("_", 1)[0]
@@ -611,7 +613,6 @@ def main():
     with tabs[0]:
         st.subheader("Buyer-Ready Price Quote")
         if ui["submit"]:
-            # Clip using training distribution for safety
             mileage_cap_series = _iqr_cap(df["Mileage"])
             x_one = pd.DataFrame([{
                 "Mileage_capped": float(np.clip(ui["Mileage"], mileage_cap_series.min(), mileage_cap_series.max())),
@@ -656,7 +657,7 @@ def main():
                 conf_text = "High confidence" if conf >= 0.85 else ("Moderate confidence" if conf >= 0.70 else "Low confidence")
                 st.caption(f"Signal: **{conf_text}** — wider intervals reduce confidence vs the dataset’s P90 range.")
 
-            # Similar listings (use the FITTED preprocessor within the trained pipeline)
+            # Similar listings
             st.markdown("#### Top-5 Similar Listings")
             preproc_fitted: ColumnTransformer = best_model.named_steps["preprocess"]
             sim_df = similar_listings(df, preproc_fitted, X, x_one[X.columns], k=5)
@@ -713,7 +714,6 @@ def main():
                                 labels={"color": "Median Price (AED)"})
                 st.plotly_chart(fig, use_container_width=True)
 
-        # Year vs Median Price
         yr = df.copy()
         yr["Year"] = pd.to_numeric(yr["Year"], errors="coerce")
         yr_line = yr.groupby("Year")["Price"].median().reset_index().dropna()
@@ -726,7 +726,6 @@ def main():
     with tabs[2]:
         st.subheader("Model Performance & Diagnostics")
 
-        # Load conformal & leaderboard from disk if available
         with open(CONFORMAL_PATH, "r") as f:
             conf_state = json.load(f)
         abs_residuals = conf_state["abs_residuals"]
@@ -746,7 +745,6 @@ def main():
         kpi_cols[4].metric("Coverage @90%", f"{evals['coverage']*100:.1f}% {success_badge_color(evals['coverage'])}")
         kpi_cols[5].metric("Avg PI Width", format_aed(evals["avg_pi_width"]))
 
-        # Leaderboard
         st.markdown("#### Model Leaderboard (Cross-Validation)")
         lb_obj = conf_state.get("leaderboard")
         if isinstance(lb_obj, list):
@@ -760,7 +758,6 @@ def main():
         else:
             st.info("Leaderboard not available.")
 
-        # Residual diagnostics
         c1, c2 = st.columns(2)
         with c1:
             fig = px.histogram(x=evals["residuals"], nbins=40, title="Residuals Histogram", labels={"x": "Residual (AED)"})
@@ -771,7 +768,6 @@ def main():
                              labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"})
             st.plotly_chart(fig, use_container_width=True)
 
-        # Feature importance (aggregated)
         with st.spinner("Computing permutation importance (aggregated)..."):
             agg_imp = permutation_importance_summary(best_model, X_test, y_test)
         fig = px.bar(agg_imp.head(20), x="importance", y="column", orientation="h",
@@ -794,7 +790,6 @@ def main():
             base_row = base.iloc[0].to_dict()
             mileage_cap_series = _iqr_cap(df["Mileage"])
 
-            # Build a baseline input from medians
             baseline = {
                 "Mileage_capped": float(np.clip(np.nanmedian(df["Mileage"]), mileage_cap_series.min(), mileage_cap_series.max())),
                 "Age": float(np.clip(pd.Timestamp.today().year - int(np.nanmedian(pd.to_numeric(df["Year"], errors="coerce"))), 0, 30)),
@@ -809,13 +804,14 @@ def main():
                 "Description": ""
             }
 
-            # Year PDP
             years = list(range(2005, 2025))
             pdp_year = []
             for yv in years:
                 xi = baseline.copy()
                 xi["Age"] = float(np.clip(pd.Timestamp.today().year - yv, 0, 30))
                 xi["Mileage_per_year"] = xi["Mileage_capped"] / max(1, xi["Age"])
+                xdf = pd.DataFrame([xi])[df.columns.intersection(list(baseline.keys()))]
+                # ensure column order matches training X
                 xdf = pd.DataFrame([xi])[X.columns]
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_year.append(pred)
@@ -823,7 +819,6 @@ def main():
                           labels={"x": "Year", "y": "Estimated Price (AED)"})
             st.plotly_chart(fig, use_container_width=True)
 
-            # Mileage PDP
             miles_grid = np.linspace(10000, 300000, 25).astype(int)
             pdp_miles = []
             for m in miles_grid:
