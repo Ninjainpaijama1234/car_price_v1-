@@ -145,7 +145,7 @@ def _maybe_text_branch(df: pd.DataFrame) -> bool:
     return (desc != "").mean() >= 0.15  # enable TF-IDF only if ≥15% non-empty
 
 def _build_ohe() -> OneHotEncoder:
-    # sklearn>=1.7 uses 'sparse_output'; older releases used 'sparse'
+    # sklearn>=1.2 uses 'sparse_output'; older releases used 'sparse'
     params = {"handle_unknown": "ignore"}
     sig = inspect.signature(OneHotEncoder)
     if "sparse_output" in sig.parameters:
@@ -239,10 +239,7 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
 # ----------------------------- Modeling & Selection ---------------------------
 
 def _rmse(y_true, y_pred) -> float:
-    try:
-        return mean_squared_error(y_true, y_pred, squared=False)
-    except TypeError:
-        return float(math.sqrt(mean_squared_error(y_true, y_pred)))
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 def _mape(y_true, y_pred) -> float:
     y_true = np.array(y_true, dtype=float)
@@ -305,7 +302,7 @@ CACHE_HASH_FUNCS = {
 }
 
 @st.cache_resource(show_spinner=True, hash_funcs=CACHE_HASH_FUNCS)
-def train_and_select_model(X: pd.DataFrame, y: np.ndarray, preprocessor: ColumnTransformer):
+def train_and_select_model(X: pd.DataFrame, y: np.ndarray, _preprocessor: ColumnTransformer):
     # Hold-out split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
 
@@ -324,8 +321,8 @@ def train_and_select_model(X: pd.DataFrame, y: np.ndarray, preprocessor: ColumnT
     for name, model, param_dist in candidates:
         pipe = Pipeline(
             steps=[
-                ("preprocess", preprocessor),
-                ("densify", FunctionTransformer(_densify, accept_sparse=True)),
+                ("preprocess", _preprocessor),
+                ("densify", FunctionTransformer(_densify, validate=False)),
                 ("model", model),
             ]
         )
@@ -666,28 +663,28 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             st.plotly_chart(px.histogram(df, x="Price", nbins=40, title="Price Distribution",
-                                         labels={"Price": "Price (AED)"}), use_container_width=True)
+                                          labels={"Price": "Price (AED)"}), use_container_width=True)
             st.plotly_chart(px.scatter(df, x="Mileage", y="Price", title="Mileage vs Price",
-                                       labels={"Mileage": "Mileage (km)", "Price": "Price (AED)"},
-                                       hover_data=["Make","Model","Year"] if set(["Make","Model","Year"]).issubset(df.columns) else None),
-                            use_container_width=True)
+                                      labels={"Mileage": "Mileage (km)", "Price": "Price (AED)"},
+                                      hover_data=["Make","Model","Year"] if set(["Make","Model","Year"]).issubset(df.columns) else None),
+                             use_container_width=True)
         with c2:
             top_makes = df["Make"].value_counts().head(12).index.tolist()
             st.plotly_chart(px.box(df[df["Make"].isin(top_makes)], x="Make", y="Price", points=False,
-                                   title="Price by Make (Top 12)", labels={"Price": "Price (AED)"}), use_container_width=True)
+                                  title="Price by Make (Top 12)", labels={"Price": "Price (AED)"}), use_container_width=True)
             heat = df.groupby(["Make","Body Type"])["Price"].median().reset_index()
             if not heat.empty:
                 pivot = heat.pivot(index="Body Type", columns="Make", values="Price").fillna(0)
                 st.plotly_chart(px.imshow(pivot, color_continuous_scale="Viridis",
-                                          title="Median Price Heatmap (Make × Body Type)",
-                                          labels={"color": "Median Price (AED)"}), use_container_width=True)
+                                         title="Median Price Heatmap (Make × Body Type)",
+                                         labels={"color": "Median Price (AED)"}), use_container_width=True)
         yr = df.copy()
         yr["Year"] = pd.to_numeric(yr["Year"], errors="coerce")
         yr_line = yr.groupby("Year")["Price"].median().reset_index().dropna()
         if not yr_line.empty:
             st.plotly_chart(px.line(yr_line, x="Year", y="Price", markers=True,
-                                    title="Median Price by Year", labels={"Price": "Median Price (AED)"}),
-                            use_container_width=True)
+                                   title="Median Price by Year", labels={"Price": "Median Price (AED)"}),
+                             use_container_width=True)
 
     # --- Model ---
     with tabs[2]:
@@ -725,19 +722,19 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             st.plotly_chart(px.histogram(x=evals["residuals"], nbins=40, title="Residuals Histogram",
-                                         labels={"x": "Residual (AED)"}), use_container_width=True)
+                                          labels={"x": "Residual (AED)"}), use_container_width=True)
         with c2:
             df_res = pd.DataFrame({"Predicted": evals["preds"], "Residual": evals["residuals"]})
             st.plotly_chart(px.scatter(df_res, x="Predicted", y="Residual", title="Residuals vs Predicted",
-                                       labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"}),
-                            use_container_width=True)
+                                      labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"}),
+                             use_container_width=True)
 
         with st.spinner("Computing permutation importance (aggregated)..."):
             agg_imp = permutation_importance_summary(best_model, X_test, y_test)
         st.plotly_chart(px.bar(agg_imp.head(20), x="importance", y="column", orientation="h",
-                               title="Top Feature Groups (Permutation Importance)",
-                               labels={"importance": "Importance (abs)", "column": "Feature Group"}),
-                        use_container_width=True)
+                                  title="Top Feature Groups (Permutation Importance)",
+                                  labels={"importance": "Importance (abs)", "column": "Feature Group"}),
+                         use_container_width=True)
 
     # --- What-If ---
     with tabs[3]:
@@ -778,7 +775,7 @@ def main():
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_year.append(pred)
             st.plotly_chart(px.line(x=years, y=pdp_year, markers=True, title="Price vs Year (holding other factors constant)",
-                                    labels={"x": "Year", "y": "Estimated Price (AED)"}), use_container_width=True)
+                                   labels={"x": "Year", "y": "Estimated Price (AED)"}), use_container_width=True)
 
             miles_grid = np.linspace(10000, 300000, 25).astype(int)
             pdp_miles = []
@@ -790,7 +787,7 @@ def main():
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_miles.append(pred)
             st.plotly_chart(px.line(x=miles_grid, y=pdp_miles, markers=True, title="Price vs Mileage (holding other factors constant)",
-                                    labels={"x": "Mileage (km)", "y": "Estimated Price (AED)"}), use_container_width=True)
+                                   labels={"x": "Mileage (km)", "y": "Estimated Price (AED)"}), use_container_width=True)
 
     # --- Data QA ---
     with tabs[4]:
@@ -798,8 +795,8 @@ def main():
         miss = df.isna().mean().reset_index()
         miss.columns = ["Column", "Missing Ratio"]
         st.plotly_chart(px.bar(miss.sort_values("Missing Ratio", ascending=False), x="Missing Ratio", y="Column", orientation="h",
-                               title="Missingness by Column", labels={"Missing Ratio": "Fraction Missing"}),
-                        use_container_width=True)
+                                  title="Missingness by Column", labels={"Missing Ratio": "Fraction Missing"}),
+                         use_container_width=True)
 
         outliers = pd.DataFrame({
             "Metric": ["Price < p1", "Price > p99", "Mileage < p1", "Mileage > p99"],
