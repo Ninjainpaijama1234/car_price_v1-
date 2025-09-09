@@ -1,11 +1,13 @@
 # app.py
 # UAE Used Car Price Predictor — Streamlit
-# Deploy-ready app with sklearn OHE compatibility + cache fix for unhashable params.
+# Robust, deploy-ready. Handles sklearn>=1.7 OneHotEncoder ('sparse_output'),
+# streamlit caching hash issues, and cross-version RMSE computation.
 
 import os
 import io
 import json
 import math
+import inspect
 import typing as t
 from dataclasses import dataclass
 
@@ -43,7 +45,8 @@ def format_aed(x: float) -> str:
         return f"{AED} -"
 
 def safe_expm1(x: t.Union[float, np.ndarray]) -> t.Union[float, np.ndarray]:
-    return np.expm1(np.clip(x, a_min=-25, a_max=25))  # clamp to avoid overflow
+    # clamp to avoid overflow surprises
+    return np.expm1(np.clip(x, a_min=-25, a_max=25))
 
 def success_badge_color(coverage: float) -> str:
     if 0.88 <= coverage <= 0.92:
@@ -73,7 +76,7 @@ def load_data(path: str) -> pd.DataFrame:
             st.stop()
         df = pd.read_csv(uploaded)
 
-    # Required columns (Description is OPTIONAL)
+    # Required columns (Description optional)
     required = [
         "Make","Model","Year","Price","Mileage","Body Type","Cylinders",
         "Transmission","Fuel Type","Color","Location"
@@ -86,6 +89,7 @@ def load_data(path: str) -> pd.DataFrame:
     if "Description" not in df.columns:
         df["Description"] = ""
 
+    # Normalize text columns
     for col in ["Make","Model","Body Type","Fuel Type","Color","Location","Transmission","Description"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
@@ -141,7 +145,17 @@ def _numeric_bounds(df: pd.DataFrame, cols: t.List[str]) -> dict:
 def _maybe_text_branch(df: pd.DataFrame) -> bool:
     desc = df["Description"].astype(str).str.strip()
     non_empty_ratio = (desc != "").mean()
-    return non_empty_ratio >= 0.15  # only if at least 15% have text
+    return non_empty_ratio >= 0.15  # activate TF-IDF only if useful share of text
+
+def _build_ohe() -> OneHotEncoder:
+    # sklearn>=1.7 uses 'sparse_output'; older uses 'sparse'
+    params = {"handle_unknown": "ignore"}
+    sig = inspect.signature(OneHotEncoder)
+    if "sparse_output" in sig.parameters:
+        params["sparse_output"] = True
+    elif "sparse" in sig.parameters:
+        params["sparse"] = True
+    return OneHotEncoder(**params)
 
 def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, ColumnTransformer, MetaInfo]:
     df = raw.copy()
@@ -164,7 +178,7 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
     df["Mileage"] = pd.to_numeric(df["Mileage"], errors="coerce")
     df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
 
-    # Robust capping (training only)
+    # Training-only capping
     df["Price_capped"] = _iqr_cap(df["Price"])
     df["Mileage_capped"] = _iqr_cap(df["Mileage"])
 
@@ -183,12 +197,6 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
     # Numeric block
     num_cols = ["Mileage_capped","Age","Mileage_per_year","Cylinders_imputed"]
 
-    # OHE cross-version (sklearn>=1.7 uses sparse_output)
-    try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
-
     transformers = [
         (
             "preprocess_num",
@@ -201,7 +209,7 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
             ),
             num_cols,
         ),
-        ("cat", ohe, cat_cols),
+        ("cat", _build_ohe(), cat_cols),
     ]
     if used_text:
         transformers.append(
@@ -242,7 +250,11 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
 # ----------------------------- Modeling & Selection ---------------------------
 
 def _rmse(y_true, y_pred) -> float:
-    return mean_squared_error(y_true, y_pred, squared=False)
+    # Cross-version safety: sklearn<0.22 lacked 'squared'; guard anyway
+    try:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        return float(math.sqrt(mean_squared_error(y_true, y_pred)))
 
 def _mape(y_true, y_pred) -> float:
     y_true = np.array(y_true, dtype=float)
@@ -295,7 +307,7 @@ def _rf_candidate():
     }
     return ("RandomForest", rf, param_dist)
 
-# CACHE FIX: Many sklearn objects are unhashable (lambdas, transformers). We instruct Streamlit how to hash them.
+# CACHE FIX: Many sklearn objects are unhashable. Provide identity hashers.
 CACHE_HASH_FUNCS = {
     ColumnTransformer: id,
     Pipeline: id,
@@ -434,6 +446,7 @@ def evaluate_holdout(
 def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarray, max_samples: int = 2000) -> pd.DataFrame:
     from sklearn.inspection import permutation_importance
 
+    # Subsample for speed
     if len(X) > max_samples:
         idx = np.random.RandomState(RANDOM_STATE).choice(len(X), size=max_samples, replace=False)
         Xs = X.iloc[idx]
@@ -613,6 +626,7 @@ def main():
     with tabs[0]:
         st.subheader("Buyer-Ready Price Quote")
         if ui["submit"]:
+            # Build single-row DataFrame matching training columns
             mileage_cap_series = _iqr_cap(df["Mileage"])
             x_one = pd.DataFrame([{
                 "Mileage_capped": float(np.clip(ui["Mileage"], mileage_cap_series.min(), mileage_cap_series.max())),
@@ -657,7 +671,7 @@ def main():
                 conf_text = "High confidence" if conf >= 0.85 else ("Moderate confidence" if conf >= 0.70 else "Low confidence")
                 st.caption(f"Signal: **{conf_text}** — wider intervals reduce confidence vs the dataset’s P90 range.")
 
-            # Similar listings
+            # Similar listings using fitted preprocessor
             st.markdown("#### Top-5 Similar Listings")
             preproc_fitted: ColumnTransformer = best_model.named_steps["preprocess"]
             sim_df = similar_listings(df, preproc_fitted, X, x_one[X.columns], k=5)
@@ -810,8 +824,6 @@ def main():
                 xi = baseline.copy()
                 xi["Age"] = float(np.clip(pd.Timestamp.today().year - yv, 0, 30))
                 xi["Mileage_per_year"] = xi["Mileage_capped"] / max(1, xi["Age"])
-                xdf = pd.DataFrame([xi])[df.columns.intersection(list(baseline.keys()))]
-                # ensure column order matches training X
                 xdf = pd.DataFrame([xi])[X.columns]
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_year.append(pred)
