@@ -1,7 +1,9 @@
 # app.py
-# UAE Used Car Price Predictor — Streamlit
-# Robust, deploy-ready. Handles sklearn>=1.7 OneHotEncoder ('sparse_output'),
-# streamlit caching hash issues, and cross-version RMSE computation.
+# UAE Used Car Price Predictor — Streamlit (deploy-ready)
+# - Fix: OneHotEncoder cross-version ('sparse_output' vs 'sparse') via _build_ohe()
+# - Robust preprocessing (no fragile selectors inside ColumnTransformer)
+# - Streamlit cache hash fixes for sklearn estimators
+# - Conformal intervals + confidence, leaderboard, diagnostics, what-if, PDF export
 
 import os
 import io
@@ -16,6 +18,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy.sparse import issparse
+
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -45,8 +48,7 @@ def format_aed(x: float) -> str:
         return f"{AED} -"
 
 def safe_expm1(x: t.Union[float, np.ndarray]) -> t.Union[float, np.ndarray]:
-    # clamp to avoid overflow surprises
-    return np.expm1(np.clip(x, a_min=-25, a_max=25))
+    return np.expm1(np.clip(x, a_min=-25, a_max=25))  # clamp extremes
 
 def success_badge_color(coverage: float) -> str:
     if 0.88 <= coverage <= 0.92:
@@ -65,7 +67,7 @@ def _densify(X):
 
 @st.cache_data(show_spinner=True)
 def load_data(path: str) -> pd.DataFrame:
-    # Try local path, then /mnt/data, else allow upload
+    # Try local path, then /mnt/data, else ask for upload
     if os.path.exists(path):
         df = pd.read_csv(path)
     elif os.path.exists(os.path.join("/mnt/data", path)):
@@ -76,7 +78,7 @@ def load_data(path: str) -> pd.DataFrame:
             st.stop()
         df = pd.read_csv(uploaded)
 
-    # Required columns (Description optional)
+    # Required columns (Description is optional)
     required = [
         "Make","Model","Year","Price","Mileage","Body Type","Cylinders",
         "Transmission","Fuel Type","Color","Location"
@@ -89,10 +91,9 @@ def load_data(path: str) -> pd.DataFrame:
     if "Description" not in df.columns:
         df["Description"] = ""
 
-    # Normalize text columns
+    # Normalize text fields
     for col in ["Make","Model","Body Type","Fuel Type","Color","Location","Transmission","Description"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
+        df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
 
     return df
 
@@ -129,11 +130,8 @@ def _iqr_cap(s: pd.Series, lower_q: float = 0.01, upper_q: float = 0.99) -> pd.S
     return s.clip(lower=lo, upper=hi)
 
 def _build_make_model_map(df: pd.DataFrame) -> dict:
-    mapping = {}
-    for mk, subset in df.groupby("Make"):
-        models = sorted(subset["Model"].dropna().unique().tolist())
-        mapping[mk] = models
-    return mapping
+    return {mk: sorted(subset["Model"].dropna().unique().tolist())
+            for mk, subset in df.groupby("Make")}
 
 def _numeric_bounds(df: pd.DataFrame, cols: t.List[str]) -> dict:
     b = {}
@@ -144,11 +142,10 @@ def _numeric_bounds(df: pd.DataFrame, cols: t.List[str]) -> dict:
 
 def _maybe_text_branch(df: pd.DataFrame) -> bool:
     desc = df["Description"].astype(str).str.strip()
-    non_empty_ratio = (desc != "").mean()
-    return non_empty_ratio >= 0.15  # activate TF-IDF only if useful share of text
+    return (desc != "").mean() >= 0.15  # enable TF-IDF only if ≥15% non-empty
 
 def _build_ohe() -> OneHotEncoder:
-    # sklearn>=1.7 uses 'sparse_output'; older uses 'sparse'
+    # sklearn>=1.7 uses 'sparse_output'; older releases used 'sparse'
     params = {"handle_unknown": "ignore"}
     sig = inspect.signature(OneHotEncoder)
     if "sparse_output" in sig.parameters:
@@ -157,15 +154,28 @@ def _build_ohe() -> OneHotEncoder:
         params["sparse"] = True
     return OneHotEncoder(**params)
 
+def _extract_text_column(X):
+    # Ensure 1D array of strings for TfidfVectorizer inside ColumnTransformer
+    if isinstance(X, pd.DataFrame):
+        if X.shape[1] == 1:
+            col = X.iloc[:, 0]
+        else:
+            col = X["Description"] if "Description" in X.columns else X.iloc[:, 0]
+        return col.fillna("").astype(str).values
+    arr = np.asarray(X)
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        arr = arr[:, 0]
+    return pd.Series(arr).fillna("").astype(str).values
+
 def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, ColumnTransformer, MetaInfo]:
     df = raw.copy()
 
-    # Cleaning
+    # Clean & simplify
     for col in ["Make","Model","Body Type","Fuel Type","Color","Location","Transmission"]:
         df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
     df["Transmission_simplified"] = df["Transmission"].apply(_simplify_transmission)
 
-    # Cylinders numeric & impute (by Make, Model then global)
+    # Cylinders -> numeric & impute by (Make, Model), else global median
     df["Cylinders"] = pd.to_numeric(df["Cylinders"], errors="coerce")
     group_median = df.groupby(["Make","Model"])["Cylinders"].transform("median")
     global_median = float(df["Cylinders"].median()) if not np.isnan(df["Cylinders"].median()) else 4.0
@@ -173,67 +183,46 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
     df.loc[df["Cylinders_imputed"].isna(), "Cylinders_imputed"] = group_median[df["Cylinders_imputed"].isna()]
     df["Cylinders_imputed"] = df["Cylinders_imputed"].fillna(global_median)
 
-    # Numeric conversions
+    # Numerics
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["Mileage"] = pd.to_numeric(df["Mileage"], errors="coerce")
     df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
 
-    # Training-only capping
+    # IQR capping (training-time)
     df["Price_capped"] = _iqr_cap(df["Price"])
     df["Mileage_capped"] = _iqr_cap(df["Mileage"])
 
-    # Derived
+    # Derived features
     current_year = pd.Timestamp.today().year
     df["Age"] = np.clip(current_year - df["Year"], 0, 30)
     df["Mileage_per_year"] = df["Mileage_capped"] / np.maximum(1, df["Age"])
 
-    # Rare category handling
+    # Rare category consolidation
     cat_cols = ["Make","Model","Body Type","Transmission_simplified","Fuel Type","Color","Location"]
     for c in cat_cols:
         df[c] = _rare_map(df[c].astype(str), min_freq=0.005)
 
     used_text = _maybe_text_branch(df)
-
-    # Numeric block
     num_cols = ["Mileage_capped","Age","Mileage_per_year","Cylinders_imputed"]
 
-    transformers = [
-        (
-            "preprocess_num",
-            Pipeline(
-                steps=[
-                    ("sel", FunctionTransformer(lambda X: X[num_cols], feature_names_out="one-to-one")),
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("scaler", RobustScaler()),
-                ]
-            ),
-            num_cols,
-        ),
-        ("cat", _build_ohe(), cat_cols),
-    ]
+    # Preprocessor (no fragile inner selectors)
+    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", RobustScaler())])
+    cat_pipe = _build_ohe()
+    transformers = [("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)]
     if used_text:
-        transformers.append(
-            (
-                "txt",
-                Pipeline(
-                    steps=[
-                        ("sel", FunctionTransformer(lambda X: X["Description"].fillna("").astype(str), validate=False)),
-                        ("tfidf", TfidfVectorizer(max_features=300, ngram_range=(1, 2))),
-                    ]
-                ),
-                "Description",
-            )
-        )
+        text_pipe = Pipeline([
+            ("to_text", FunctionTransformer(_extract_text_column, validate=False)),
+            ("tfidf", TfidfVectorizer(max_features=300, ngram_range=(1, 2))),
+        ])
+        transformers.append(("txt", text_pipe, ["Description"]))
 
-    preprocessor = ColumnTransformer(
-        transformers=transformers, remainder="drop", sparse_threshold=0.3
-    )
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop", sparse_threshold=0.3)
 
-    # Target transform (log1p)
+    # Target: log1p(price)
     y = np.log1p(df["Price_capped"].values.astype(float))
     X = df[num_cols + cat_cols + (["Description"] if used_text else [])].copy()
 
-    # Meta for UI and confidence
+    # Meta for UI & conformal confidence
     p5, p95 = np.nanpercentile(df["Price"].values, [5, 95])
     meta = MetaInfo(
         numeric_bounds=_numeric_bounds(df, ["Mileage","Year","Cylinders_imputed"]),
@@ -250,7 +239,6 @@ def make_features(raw: pd.DataFrame) -> t.Tuple[pd.DataFrame, np.ndarray, Column
 # ----------------------------- Modeling & Selection ---------------------------
 
 def _rmse(y_true, y_pred) -> float:
-    # Cross-version safety: sklearn<0.22 lacked 'squared'; guard anyway
     try:
         return mean_squared_error(y_true, y_pred, squared=False)
     except TypeError:
@@ -307,7 +295,7 @@ def _rf_candidate():
     }
     return ("RandomForest", rf, param_dist)
 
-# CACHE FIX: Many sklearn objects are unhashable. Provide identity hashers.
+# Cache hashers for unhashable sklearn objects (avoid UnhashableParamError)
 CACHE_HASH_FUNCS = {
     ColumnTransformer: id,
     Pipeline: id,
@@ -318,7 +306,7 @@ CACHE_HASH_FUNCS = {
 
 @st.cache_resource(show_spinner=True, hash_funcs=CACHE_HASH_FUNCS)
 def train_and_select_model(X: pd.DataFrame, y: np.ndarray, preprocessor: ColumnTransformer):
-    # Hold-out
+    # Hold-out split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
 
     # Candidates
@@ -355,29 +343,23 @@ def train_and_select_model(X: pd.DataFrame, y: np.ndarray, preprocessor: ColumnT
         search.fit(X_train, y_train)
 
         cv_mae = -search.best_score_
-
-        # OOF metrics (in AED)
         oof_pred = cross_val_predict(search.best_estimator_, X_train, y_train, cv=kf, n_jobs=-1)
         oof_pred_aed = _inverse_predict(oof_pred)
         y_train_aed = _inverse_predict(y_train)
         r2 = r2_score(y_train_aed, oof_pred_aed)
         rmse = _rmse(y_train_aed, oof_pred_aed)
-        leaderboard.append(
-            {
-                "Model": name,
-                "CV MAE (AED)": float(cv_mae),
-                "Train OOF R²": float(r2),
-                "Train OOF RMSE (AED)": float(rmse),
-            }
-        )
+
+        leaderboard.append({"Model": name, "CV MAE (AED)": float(cv_mae),
+                            "Train OOF R²": float(r2), "Train OOF RMSE (AED)": float(rmse)})
+
         if cv_mae < best_cv_mae:
             best_cv_mae = cv_mae
             best = search.best_estimator_
 
-    # Fit best on all training data
+    # Fit best on all training
     best.fit(X_train, y_train)
 
-    # Conformal calibration residuals using OOF with best pipeline
+    # Conformal calibration residuals (OOF on train)
     oof_pred_best = cross_val_predict(best, X_train, y_train, cv=kf, n_jobs=-1)
     oof_pred_best_aed = _inverse_predict(oof_pred_best)
     y_train_aed = _inverse_predict(y_train)
@@ -432,15 +414,9 @@ def evaluate_holdout(
     avg_pi_width = float(np.mean(hi - lo))
     residuals = y_true - preds
     return {
-        "r2": r2,
-        "mae": mae,
-        "rmse": rmse,
-        "mape": mape,
-        "coverage": coverage,
-        "avg_pi_width": avg_pi_width,
-        "residuals": residuals,
-        "preds": preds,
-        "y_true": y_true,
+        "r2": r2, "mae": mae, "rmse": rmse, "mape": mape,
+        "coverage": coverage, "avg_pi_width": avg_pi_width,
+        "residuals": residuals, "preds": preds, "y_true": y_true,
     }
 
 def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarray, max_samples: int = 2000) -> pd.DataFrame:
@@ -449,8 +425,7 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
     # Subsample for speed
     if len(X) > max_samples:
         idx = np.random.RandomState(RANDOM_STATE).choice(len(X), size=max_samples, replace=False)
-        Xs = X.iloc[idx]
-        ys = y[idx]
+        Xs = X.iloc[idx]; ys = y[idx]
     else:
         Xs, ys = X, y
 
@@ -466,10 +441,9 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
         feature_names = [f"f{i}" for i in range(len(r.importances_mean))]
 
     def base_col(name: str) -> str:
+        # Map 'num__Mileage_capped' -> 'Mileage_capped', 'cat__Make_*' -> 'Make', 'txt__tfidf__*' -> 'Description'
         if name.startswith("cat__"):
             return name.split("__", 1)[1].split("_", 1)[0]
-        if name.startswith("preprocess_num__"):
-            return name.split("__", 1)[1]
         if name.startswith("num__"):
             return name.split("__", 1)[1]
         if name.startswith("txt__"):
@@ -486,10 +460,8 @@ def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarr
 def similar_listings(df_raw: pd.DataFrame, preproc_fitted: ColumnTransformer, X: pd.DataFrame, x_one: pd.DataFrame, k: int = 5) -> pd.DataFrame:
     Xt_all = preproc_fitted.transform(X)
     Xt_one = preproc_fitted.transform(x_one)
-    if issparse(Xt_all):
-        Xt_all = Xt_all.toarray()
-    if issparse(Xt_one):
-        Xt_one = Xt_one.toarray()
+    if issparse(Xt_all): Xt_all = Xt_all.toarray()
+    if issparse(Xt_one): Xt_one = Xt_one.toarray()
     nn = NearestNeighbors(n_neighbors=k, metric="euclidean").fit(Xt_all)
     dists, idxs = nn.kneighbors(Xt_one)
     sim = df_raw.iloc[idxs[0]].copy()
@@ -522,9 +494,8 @@ def build_pdf_quote(payload: dict) -> bytes:
     c.setStrokeColor(colors.lightgrey)
     c.line(25*mm, y, W - 25*mm, y)
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(30*mm, y - 10*mm, "This quote includes distribution-free conformal prediction intervals.")
-    c.showPage()
-    c.save()
+    c.drawString(30*mm, y - 10*mm, "Includes distribution-free conformal intervals.")
+    c.showPage(); c.save()
     return buf.getvalue()
 
 # ----------------------------- UI Helpers -------------------------------------
@@ -580,7 +551,7 @@ def main():
     st.title("🚗 UAE Used Car Price Predictor")
     st.caption("Prediction with uncertainty via conformal intervals. Fast. Interpretable. Buyer-friendly.")
 
-    # Load data & build features
+    # Data & features
     df = load_data(DEFAULT_DATA_PATH)
     X, y, preprocessor, meta = make_features(df)
 
@@ -597,16 +568,10 @@ def main():
     else:
         with st.spinner("Training models & selecting the best..."):
             best_model, lb, cv_meta = train_and_select_model(X, y, preprocessor)
-
-        # Persist
         joblib.dump(best_model, BEST_MODEL_PATH)
-
-        # Save conformal state & hold-out indices
-        X_test = cv_meta["X_test"]
-        y_test = cv_meta["y_test"]
+        X_test = cv_meta["X_test"]; y_test = cv_meta["y_test"]
         abs_residuals = cv_meta["abs_residuals"]
         leaderboard_cache = lb.to_dict(orient="records")
-
         conf_dump = {
             "abs_residuals": abs_residuals,
             "X_test_idx": X_test.index.tolist(),
@@ -617,36 +582,30 @@ def main():
             json.dump(conf_dump, f)
         X_test_idx = X_test.index.tolist()
 
-    # Sidebar inputs
+    # Sidebar UI
     ui = sidebar_inputs(df, meta)
 
     tabs = st.tabs(["💰 Price Quote", "📈 Insights", "🧠 Model", "🔧 What-If", "🧪 Data QA"])
 
-    # --- Price Quote Tab ---
+    # --- Price Quote ---
     with tabs[0]:
         st.subheader("Buyer-Ready Price Quote")
         if ui["submit"]:
-            # Build single-row DataFrame matching training columns
             mileage_cap_series = _iqr_cap(df["Mileage"])
             x_one = pd.DataFrame([{
                 "Mileage_capped": float(np.clip(ui["Mileage"], mileage_cap_series.min(), mileage_cap_series.max())),
                 "Age": float(np.clip(pd.Timestamp.today().year - ui["Year"], 0, 30)),
                 "Mileage_per_year": float(np.clip(ui["Mileage"], mileage_cap_series.min(), mileage_cap_series.max())) / max(1, (pd.Timestamp.today().year - ui["Year"])),
                 "Cylinders_imputed": float(ui["Cylinders"]) if ui["Cylinders"] is not None else (float(df["Cylinders"].median()) if not df["Cylinders"].dropna().empty else 4.0),
-                "Make": ui["Make"],
-                "Model": ui["Model"],
-                "Body Type": ui["Body Type"],
-                "Transmission_simplified": ui["Transmission"],
-                "Fuel Type": ui["Fuel Type"],
-                "Color": ui["Color"],
-                "Location": ui["Location"],
-                "Description": ui["Description"] or ""
+                "Make": ui["Make"], "Model": ui["Model"], "Body Type": ui["Body Type"],
+                "Transmission_simplified": ui["Transmission"], "Fuel Type": ui["Fuel Type"],
+                "Color": ui["Color"], "Location": ui["Location"], "Description": ui["Description"] or ""
             }])
 
             alpha = 1 - (ui["coverage"] / 100.0)
             y_hat, lo, hi, conf = predict_with_interval(
                 best_model,
-                x_one[X.columns],
+                x_one[X.columns],  # strict column order
                 abs_residuals,
                 alpha,
                 meta.p90_range,
@@ -669,9 +628,9 @@ def main():
                 gauge.update_layout(height=220, margin=dict(l=10, r=10, b=10, t=40))
                 st.plotly_chart(gauge, use_container_width=True)
                 conf_text = "High confidence" if conf >= 0.85 else ("Moderate confidence" if conf >= 0.70 else "Low confidence")
-                st.caption(f"Signal: **{conf_text}** — wider intervals reduce confidence vs the dataset’s P90 range.")
+                st.caption(f"Signal: **{conf_text}** — interval width relative to dataset P90 range.")
 
-            # Similar listings using fitted preprocessor
+            # Similar listings (Nearest Neighbors on transformed space)
             st.markdown("#### Top-5 Similar Listings")
             preproc_fitted: ColumnTransformer = best_model.named_steps["preprocess"]
             sim_df = similar_listings(df, preproc_fitted, X, x_one[X.columns], k=5)
@@ -699,53 +658,45 @@ def main():
             if pdf_bytes:
                 st.download_button("Download Quote (PDF)", data=pdf_bytes, file_name="price_quote.pdf", mime="application/pdf")
             else:
-                st.caption("Install `reportlab` to enable PDF export (already included in requirements).")
+                st.caption("Install `reportlab` to enable PDF export (already included).")
 
-    # --- Insights Tab ---
+    # --- Insights ---
     with tabs[1]:
         st.subheader("Market Insights")
         c1, c2 = st.columns(2)
         with c1:
-            fig = px.histogram(df, x="Price", nbins=40, title="Price Distribution", labels={"Price": "Price (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
-
-            fig = px.scatter(df, x="Mileage", y="Price",
-                             title="Mileage vs Price",
-                             labels={"Mileage": "Mileage (km)", "Price": "Price (AED)"},
-                             hover_data=["Make","Model","Year"] if set(["Make","Model","Year"]).issubset(df.columns) else None)
-            st.plotly_chart(fig, use_container_width=True)
-
+            st.plotly_chart(px.histogram(df, x="Price", nbins=40, title="Price Distribution",
+                                         labels={"Price": "Price (AED)"}), use_container_width=True)
+            st.plotly_chart(px.scatter(df, x="Mileage", y="Price", title="Mileage vs Price",
+                                       labels={"Mileage": "Mileage (km)", "Price": "Price (AED)"},
+                                       hover_data=["Make","Model","Year"] if set(["Make","Model","Year"]).issubset(df.columns) else None),
+                            use_container_width=True)
         with c2:
             top_makes = df["Make"].value_counts().head(12).index.tolist()
-            box = px.box(df[df["Make"].isin(top_makes)], x="Make", y="Price", points=False,
-                         title="Price by Make (Top 12)", labels={"Price": "Price (AED)"})
-            st.plotly_chart(box, use_container_width=True)
-
+            st.plotly_chart(px.box(df[df["Make"].isin(top_makes)], x="Make", y="Price", points=False,
+                                   title="Price by Make (Top 12)", labels={"Price": "Price (AED)"}), use_container_width=True)
             heat = df.groupby(["Make","Body Type"])["Price"].median().reset_index()
             if not heat.empty:
                 pivot = heat.pivot(index="Body Type", columns="Make", values="Price").fillna(0)
-                fig = px.imshow(pivot, color_continuous_scale="Viridis", title="Median Price Heatmap (Make × Body Type)",
-                                labels={"color": "Median Price (AED)"})
-                st.plotly_chart(fig, use_container_width=True)
-
+                st.plotly_chart(px.imshow(pivot, color_continuous_scale="Viridis",
+                                          title="Median Price Heatmap (Make × Body Type)",
+                                          labels={"color": "Median Price (AED)"}), use_container_width=True)
         yr = df.copy()
         yr["Year"] = pd.to_numeric(yr["Year"], errors="coerce")
         yr_line = yr.groupby("Year")["Price"].median().reset_index().dropna()
         if not yr_line.empty:
-            fig = px.line(yr_line, x="Year", y="Price", markers=True, title="Median Price by Year",
-                          labels={"Price": "Median Price (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.line(yr_line, x="Year", y="Price", markers=True,
+                                    title="Median Price by Year", labels={"Price": "Median Price (AED)"}),
+                            use_container_width=True)
 
-    # --- Model Tab ---
+    # --- Model ---
     with tabs[2]:
         st.subheader("Model Performance & Diagnostics")
-
         with open(CONFORMAL_PATH, "r") as f:
             conf_state = json.load(f)
         abs_residuals = conf_state["abs_residuals"]
         X_test_idx = conf_state["X_test_idx"]
         y_test = np.array(conf_state["y_test"])
-
         X_test = X.iloc[X_test_idx]
 
         alpha_default = 0.1
@@ -762,8 +713,7 @@ def main():
         st.markdown("#### Model Leaderboard (Cross-Validation)")
         lb_obj = conf_state.get("leaderboard")
         if isinstance(lb_obj, list):
-            lb = pd.DataFrame(lb_obj)
-            st.dataframe(lb, use_container_width=True)
+            st.dataframe(pd.DataFrame(lb_obj), use_container_width=True)
         elif isinstance(lb_obj, dict):
             try:
                 st.dataframe(pd.DataFrame(lb_obj), use_container_width=True)
@@ -774,22 +724,22 @@ def main():
 
         c1, c2 = st.columns(2)
         with c1:
-            fig = px.histogram(x=evals["residuals"], nbins=40, title="Residuals Histogram", labels={"x": "Residual (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.histogram(x=evals["residuals"], nbins=40, title="Residuals Histogram",
+                                         labels={"x": "Residual (AED)"}), use_container_width=True)
         with c2:
             df_res = pd.DataFrame({"Predicted": evals["preds"], "Residual": evals["residuals"]})
-            fig = px.scatter(df_res, x="Predicted", y="Residual", title="Residuals vs Predicted",
-                             labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.scatter(df_res, x="Predicted", y="Residual", title="Residuals vs Predicted",
+                                       labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"}),
+                            use_container_width=True)
 
         with st.spinner("Computing permutation importance (aggregated)..."):
             agg_imp = permutation_importance_summary(best_model, X_test, y_test)
-        fig = px.bar(agg_imp.head(20), x="importance", y="column", orientation="h",
-                     title="Top Feature Groups (Permutation Importance)",
-                     labels={"importance": "Importance (abs)", "column": "Feature Group"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(px.bar(agg_imp.head(20), x="importance", y="column", orientation="h",
+                               title="Top Feature Groups (Permutation Importance)",
+                               labels={"importance": "Importance (abs)", "column": "Feature Group"}),
+                        use_container_width=True)
 
-    # --- What-If Tab ---
+    # --- What-If ---
     with tabs[3]:
         st.subheader("What-If Sensitivity")
         colA, colB = st.columns(2)
@@ -827,9 +777,8 @@ def main():
                 xdf = pd.DataFrame([xi])[X.columns]
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_year.append(pred)
-            fig = px.line(x=years, y=pdp_year, markers=True, title="Price vs Year (holding other factors constant)",
-                          labels={"x": "Year", "y": "Estimated Price (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.line(x=years, y=pdp_year, markers=True, title="Price vs Year (holding other factors constant)",
+                                    labels={"x": "Year", "y": "Estimated Price (AED)"}), use_container_width=True)
 
             miles_grid = np.linspace(10000, 300000, 25).astype(int)
             pdp_miles = []
@@ -840,18 +789,17 @@ def main():
                 xdf = pd.DataFrame([xi])[X.columns]
                 pred = _inverse_predict(best_model.predict(xdf))[0]
                 pdp_miles.append(pred)
-            fig = px.line(x=miles_grid, y=pdp_miles, markers=True, title="Price vs Mileage (holding other factors constant)",
-                          labels={"x": "Mileage (km)", "y": "Estimated Price (AED)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.line(x=miles_grid, y=pdp_miles, markers=True, title="Price vs Mileage (holding other factors constant)",
+                                    labels={"x": "Mileage (km)", "y": "Estimated Price (AED)"}), use_container_width=True)
 
-    # --- Data QA Tab ---
+    # --- Data QA ---
     with tabs[4]:
         st.subheader("Data QA")
         miss = df.isna().mean().reset_index()
         miss.columns = ["Column", "Missing Ratio"]
-        fig = px.bar(miss.sort_values("Missing Ratio", ascending=False), x="Missing Ratio", y="Column", orientation="h",
-                     title="Missingness by Column", labels={"Missing Ratio": "Fraction Missing"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(px.bar(miss.sort_values("Missing Ratio", ascending=False), x="Missing Ratio", y="Column", orientation="h",
+                               title="Missingness by Column", labels={"Missing Ratio": "Fraction Missing"}),
+                        use_container_width=True)
 
         outliers = pd.DataFrame({
             "Metric": ["Price < p1", "Price > p99", "Mileage < p1", "Mileage > p99"],
@@ -863,10 +811,8 @@ def main():
             ],
         })
         st.dataframe(outliers, use_container_width=True)
-
         card = pd.DataFrame({"Column": df.columns, "Cardinality": [df[c].nunique() for c in df.columns]})
         st.dataframe(card.sort_values("Cardinality", ascending=False), use_container_width=True)
-
         st.markdown("#### Sample Rows")
         st.dataframe(df.sample(min(10, len(df))), use_container_width=True)
 
