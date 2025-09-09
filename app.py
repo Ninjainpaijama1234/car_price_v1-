@@ -217,7 +217,8 @@ def sidebar_inputs(df: pd.DataFrame, meta: MetaInfo) -> dict:
     color = st.sidebar.selectbox("Color", options=sorted(df["Color"].unique()))
     loc = st.sidebar.selectbox("Location", options=sorted(df["Location"].unique()))
     
-    cyl_options = ["Auto-impute"] + sorted(df["Cylinders"].dropna().unique().astype(int).tolist())
+    clean_cylinders = pd.to_numeric(df["Cylinders"], errors='coerce').dropna().unique()
+    cyl_options = ["Auto-impute"] + sorted([int(c) for c in clean_cylinders])
     cylinders_opt = st.sidebar.selectbox("Cylinders", options=cyl_options)
     cylinders = None if cylinders_opt == "Auto-impute" else int(cylinders_opt)
 
@@ -293,3 +294,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
