@@ -1,5 +1,7 @@
 # app.py
 # UAE Used Car Price Predictor — Streamlit (deploy-ready, auto-trains if needed)
+# Fix: permutation_importance now operates & labels in INPUT space (X.columns),
+# preventing length mismatch with transformed features.
 
 import os
 import io
@@ -416,34 +418,38 @@ def evaluate_holdout(
     }
 
 def permutation_importance_summary(model: Pipeline, X: pd.DataFrame, y: np.ndarray, max_samples: int = 2000) -> pd.DataFrame:
+    """Compute permutation importance in INPUT space (on X columns),
+    avoiding mismatch with transformed feature counts."""
     from sklearn.inspection import permutation_importance
+
     # Subsample for speed
     if len(X) > max_samples:
         idx = np.random.RandomState(RANDOM_STATE).choice(len(X), size=max_samples, replace=False)
-        Xs = X.iloc[idx]; ys = y[idx]
+        Xs = X.iloc[idx]
+        ys = y[idx]
     else:
         Xs, ys = X, y
+
+    # Ensure DataFrame for stable column operations
+    if not isinstance(Xs, pd.DataFrame):
+        Xs = pd.DataFrame(Xs, columns=[f"feature_{i}" for i in range(np.shape(Xs)[1])])
+
+    # Compute permutation importance on the pipeline (which includes preprocessing)
     r = permutation_importance(
         model, Xs, ys, n_repeats=5, random_state=RANDOM_STATE, n_jobs=-1, scoring="neg_mean_absolute_error"
     )
-    # Feature names from fitted preprocessor
-    try:
-        ct: ColumnTransformer = model.named_steps["preprocess"]
-        feature_names = ct.get_feature_names_out().tolist()
-    except Exception:
-        feature_names = [f"f{i}" for i in range(len(r.importances_mean))]
 
-    def base_col(name: str) -> str:
-        if name.startswith("cat__"):
-            return name.split("__", 1)[1].split("_", 1)[0]
-        if name.startswith("num__"):
-            return name.split("__", 1)[1]
-        if name.startswith("txt__"):
-            return "Description"
-        return name
+    feature_names = list(Xs.columns)
+    importances = np.abs(r.importances_mean)
 
-    df_imp = pd.DataFrame({"feature": feature_names, "importance": np.abs(r.importances_mean)})
-    df_imp["column"] = df_imp["feature"].apply(base_col)
+    # Guard: align lengths; if mismatch, fallback to generic names
+    if len(feature_names) != len(importances):
+        feature_names = [f"feature_{i}" for i in range(len(importances))]
+
+    df_imp = pd.DataFrame({"feature": feature_names, "importance": importances})
+    # Optional: tidy names for UI
+    df_imp["column"] = df_imp["feature"].replace({"Transmission_simplified": "Transmission"})
+    # In input space, features are already "grouped"; return top 20
     agg = df_imp.groupby("column", as_index=False)["importance"].sum().sort_values("importance", ascending=False).head(20)
     return agg
 
@@ -716,11 +722,11 @@ def main():
                                        labels={"Predicted": "Predicted Price (AED)", "Residual": "Residual (AED)"}),
                             use_container_width=True)
 
-        with st.spinner("Computing permutation importance (aggregated)..."):
+        with st.spinner("Computing permutation importance (input-level)…"):
             agg_imp = permutation_importance_summary(best_model, X_test, y_test)
         st.plotly_chart(px.bar(agg_imp.head(20), x="importance", y="column", orientation="h",
-                               title="Top Feature Groups (Permutation Importance)",
-                               labels={"importance": "Importance (abs)", "column": "Feature Group"}),
+                               title="Top Input Features (Permutation Importance)",
+                               labels={"importance": "Importance (abs)", "column": "Feature"}),
                         use_container_width=True)
 
 if __name__ == "__main__":
